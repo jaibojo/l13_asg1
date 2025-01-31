@@ -483,10 +483,16 @@ train_loader = StreamingDataLoader(config)
 # NEW CODE
 # Define training parameters
 num_epochs = 25  # Number of epochs
-batches_per_epoch = len(train_loader.buffer) // (train_loader.batch_size * train_loader.sequence_length)
+
+# Define number of tokens per epoch (e.g., 1 million tokens)
+tokens_per_epoch = 1_000_000
+batches_per_epoch = tokens_per_epoch // (config['training']['batch_size'] * config['training']['sequence_length'])
+
+print(f"Starting training for {num_epochs} epochs, {batches_per_epoch} batches per epoch")
+print(f"Batch size: {config['training']['batch_size']}, Sequence length: {config['training']['sequence_length']}")
+print(f"Total tokens per epoch: {tokens_per_epoch:,}")
 
 # Training hyperparameters
-batch_size = 8                     # Changed from 4 to 8
 accumulation_steps = 2             # New parameter
 sequence_length = 2048             # Changed from 32 to 2048
 initial_lr = 3e-3                  # Changed from 6e-4 to 3e-3
@@ -595,101 +601,154 @@ global_step = 0
 best_loss = float('inf')
 total_steps = config['training']['num_training_steps']
 
-try:
+def generate_text(model, tokenizer, prompt, max_words=50, device='cpu'):
+    # Tokenize the prompt
+    input_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
+    
+    # Generate text
+    with torch.no_grad():
+        generated_tokens = []
+        for _ in range(max_words * 3):  # *3 as a token != word approximation
+            outputs, _ = model(input_ids)
+            next_token_logits = outputs[:, -1, :]
+            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
+            generated_tokens.append(next_token.item())
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
+            
+            # Stop if we generate a newline or exceed max length
+            if next_token.item() == tokenizer.encode('\n')[0]:
+                break
+    
+    # Decode the generated text
+    generated_text = tokenizer.decode(generated_tokens)
+    return generated_text
+
+def interactive_evaluation(model, tokenizer, device):
+    model.eval()  # Set model to evaluation mode
+    
+    while True:
+        prompt = input("\nEnter your prompt (or 'exit' to return to training): ")
+        if prompt.lower() == 'exit':
+            break
+            
+        try:
+            max_words = int(input("Enter maximum number of words for the response: "))
+        except ValueError:
+            print("Invalid input. Using default of 50 words.")
+            max_words = 50
+            
+        print("\nGenerating response...")
+        response = generate_text(model, tokenizer, prompt, max_words, device)
+        print(f"\nModel's response:\n{response}")
+        
+        continue_eval = input("\nWould you like to try another prompt? (yes/no): ")
+        if continue_eval.lower() != 'yes':
+            break
+    
+    model.train()  # Set model back to training mode
+    return
+
+def train_with_periodic_eval(model, train_loader, optimizer, device, initial_prompt=None):
+    if initial_prompt is None:
+        # Get initial prompt from user
+        initial_prompt = input("\nEnter a prompt to evaluate throughout training: ")
+        try:
+            max_words = int(input("Enter maximum number of words for the responses: "))
+        except ValueError:
+            print("Invalid input. Using default of 50 words.")
+            max_words = 50
+    else:
+        max_words = 50  # Default for continued training
+    
+    print(f"\nInitial prompt: '{initial_prompt}'")
+    print(f"Will generate responses every 500 steps until step 5000")
+    
     total_tokens = 0
     total_time = 0
     losses = []
+    eval_interval = 500
+    max_steps = 5000
     
-    for i in range(50):  # Using 50 iterations as in your original code
-        try:
-            t0 = time.time()
-            
-            x, y = train_loader.next_batch()
-            
-            # Validate input tokens are within vocabulary range
-            if x.max() >= config['model']['model_config']['vocab_size']:
-                print(f"Warning: Input contains token {x.max()} which is >= vocab_size {config['model']['model_config']['vocab_size']}")
-                continue
+    try:
+        for i in range(max_steps):
+            try:
+                t0 = time.time()
                 
-            x, y = x.to(device), y.to(device)
+                x, y = train_loader.next_batch()
+                if x.max() >= config['model']['model_config']['vocab_size']:
+                    continue
+                    
+                x, y = x.to(device), y.to(device)
+                
+                optimizer.zero_grad()
+                logits, loss = model(x, y)
+                loss.backward()
+                optimizer.step()
+                
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                t1 = time.time()
+                dt = (t1 - t0) * 1000
+                
+                batch_tokens = x.numel()
+                tokens_per_sec = batch_tokens / (t1 - t0)
+                
+                total_tokens += batch_tokens
+                total_time += (t1 - t0)
+                losses.append(loss.item())
+                
+                print(f'step[{i:3d}] | loss: {loss.item():6.3f} | dt: {dt:7.2f}ms | tok/sec: {tokens_per_sec:10.2f}')
+                
+                # Evaluate on the same prompt every 500 steps
+                if i > 0 and i % eval_interval == 0:
+                    print(f"\n=== Evaluation at step {i} ===")
+                    model.eval()
+                    response = generate_text(model, train_loader.tokenizer, initial_prompt, max_words, device)
+                    print(f"Prompt: {initial_prompt}")
+                    print(f"Response: {response}")
+                    model.train()
+                
+            except Exception as e:
+                print(f"Error in training step: {e}")
+                continue
             
-            optimizer.zero_grad()
-            logits, loss = model(x, y)
-            
-            loss.backward()
-            optimizer.step()
-            
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            
-            t1 = time.time()
-            dt = (t1 - t0) * 1000  # Convert to milliseconds
-            
-            # Calculate tokens per second
-            batch_tokens = x.numel()  # Number of tokens in this batch
-            tokens_per_sec = batch_tokens / (t1 - t0)
-            
-            total_tokens += batch_tokens
-            total_time += (t1 - t0)
-            losses.append(loss.item())
-            
-            print(f'step[{i:3d}] | loss: {loss.item():6.3f} | dt: {dt:7.2f}ms | tok/sec: {tokens_per_sec:10.2f}')
-            
-        except Exception as e:
-            print(f"Error in training step: {e}")
-            continue
+        # Save checkpoint at 5000 steps
+        print("\nReached 5000 steps. Saving checkpoint...")
+        save_checkpoint(
+            model, optimizer, i, losses[-1],
+            is_best=(losses[-1] < best_loss)
+        )
+        
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user")
+    except Exception as e:
+        print(f"\nTraining failed with error: {e}")
+    finally:
+        if losses:
+            print(f'Final loss: {losses[-1]:.4f}')
+            save_checkpoint(
+                model, optimizer, i, losses[-1],
+                is_best=(losses[-1] < best_loss)
+            )
     
-    # Print summary only if we have losses
-    if losses:
-        avg_loss = sum(losses) / len(losses)
-        print(f"\nTraining Summary:")
-        print(f"Average loss: {avg_loss:.4f}")
-        print(f"Total tokens processed: {total_tokens:,}")
-        print(f"Total time: {total_time:.2f} seconds")
-        if total_time > 0:
-            print(f"Average tokens/sec: {total_tokens/total_time:,.2f}")
-    else:
-        print("No successful training steps completed")
+    return initial_prompt, max_words  # Return these for continued training
 
-except KeyboardInterrupt:
-    print("\nTraining interrupted by user")
-except Exception as e:
-    print(f"\nTraining failed with error: {e}")
-finally:
-    if 'loss' in locals() and losses:
-        print(f'Final loss: {losses[-1]:.4f}')  # Use the last loss from losses list
-    else:
-        print("No loss value available")
+# First training phase (5000 steps)
+print("Starting initial training phase (5000 steps)")
+initial_prompt, max_words = train_with_periodic_eval(model, train_loader, optimizer, device)
 
-# Remove the print(loss) statement after the training loop
-# import sys; sys.exit(0)  # Keep this if you want to exit
+# Load the checkpoint
+latest_checkpoint = os.path.join(checkpoint_dir, sorted([f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_')])[-1])
+model, optimizer, _, _, _ = load_checkpoint(latest_checkpoint)
+model.to(device)
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits = model(x)[0] # (B, T, vocab_size)
-        # take the logits at the last position
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1)
-        # do top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probabilities
-        # note: multinomial does not demand the input to sum to 1
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append to the sequence
-        x = torch.cat((x, xcol), dim=1)
+# Second training phase (50 more steps)
+print("\nStarting second training phase (50 steps)")
+max_steps = 50  # Override max_steps for the second phase
+train_with_periodic_eval(model, train_loader, optimizer, device, initial_prompt=initial_prompt)
 
-# print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+print("\nTraining completed. Final checkpoint saved.")
 
 # Add validation loop to monitor overfitting
 # Add early stopping
