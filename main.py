@@ -102,16 +102,22 @@ class GPTConfig:
 class LlamaRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000.0):
         super().__init__()
+        # Create inverse frequency bands
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
         self.max_position_embeddings = max_position_embeddings
+        self.dim = dim
 
     def forward(self, x, seq_len):
+        # Create position indices
         t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+        # Calculate freqs
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        # Create complex numbers in real space
         emb = torch.cat((freqs, freqs), dim=-1)
-        # Reshape to match input dimensions
-        return emb[None, None, :, :]  # Add batch and head dimensions
+        # Match dimensions with input
+        emb = emb.view(1, seq_len, 1, self.dim)  # [1, seq_len, 1, dim]
+        return emb
 
 class LlamaRMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
@@ -155,12 +161,12 @@ class LlamaSdpaAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim)
         
-        # Get rotary embeddings
-        rot_emb = self.rotary_emb(x, T)  # Now shape [1, 1, T, d]
+        # Get rotary embeddings with correct shape
+        rot_emb = self.rotary_emb(x, T)  # [1, T, 1, d]
         
-        # Apply rotary embeddings - broadcasting will handle the batch and head dimensions
-        q = q * torch.cos(rot_emb) + self.rotate_half(q) * torch.sin(rot_emb)
-        k = k * torch.cos(rot_emb) + self.rotate_half(k) * torch.sin(rot_emb)
+        # Apply rotary embeddings - broadcasting will handle batch and head dimensions
+        q = (q * torch.cos(rot_emb)) + (self.rotate_half(q) * torch.sin(rot_emb))
+        k = (k * torch.cos(rot_emb)) + (self.rotate_half(k) * torch.sin(rot_emb))
         
         # Repeat k,v heads to match number of q heads
         k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
