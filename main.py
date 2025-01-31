@@ -10,7 +10,13 @@ from torch.nn import functional as F
 import yaml
 import tiktoken
 from datasets import load_dataset
-from flash_attn import flash_attn_func  # Add this import at the top
+
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTENTION_AVAILABLE = True
+except ImportError:
+    print("Flash Attention not available. Using regular attention.")
+    FLASH_ATTENTION_AVAILABLE = False
 
 
 class CausalSelfAttention(nn.Module):
@@ -66,7 +72,6 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
@@ -89,8 +94,6 @@ class GPTConfig:
     n_embd: int = 576              # Changed from 768 to 576
     intermediate_size: int = 1536   # New parameter for MLP
     n_kv_heads: int = 3            # New parameter for grouped-query attention
-    
-    # New parameters
     hidden_act: str = 'silu'       # Changed from GELU to SiLU
     rms_norm_eps: float = 1e-5     # For RMSNorm
     rope_theta: float = 10000.0    # RoPE parameter
@@ -289,9 +292,14 @@ class GPT(nn.Module):
 device = 'cpu'
 if torch.cuda.is_available():
     device = 'cuda'
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"using device: {device}")
+elif torch.backends.mps.is_available():
+    device = 'mps'
+print(f"Using device: {device}")
+
+if device == 'cpu':
+    print("Warning: Running on CPU. This will be very slow!")
+    if not torch.cuda.is_available():
+        print("CUDA not available. Consider using a GPU for better performance.")
 
 # SEED
 torch.manual_seed(1337)
@@ -417,7 +425,7 @@ train_loader = StreamingDataLoader(config)
 # NEW CODE
 # Define training parameters
 num_epochs = 25  # Number of epochs
-batches_per_epoch = len(train_loader.tokens) // (train_loader.B * train_loader.T)
+batches_per_epoch = len(train_loader.buffer) // (train_loader.batch_size * train_loader.sequence_length)
 
 # Training hyperparameters
 batch_size = 8                     # Changed from 4 to 8
@@ -428,14 +436,24 @@ weight_decay = 0.01                # Changed from 0.1 to 0.01
 num_training_steps = 600000        # New parameter
 
 # Optimizer changes
-optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=initial_lr,
-    betas=(0.9, 0.95),            # Changed from default
-    eps=1e-8,
-    weight_decay=weight_decay,
-    fused=True                     # Enable fused implementation
-)
+try:
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=initial_lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=weight_decay,
+        fused=True
+    )
+except RuntimeError:
+    # Fallback to non-fused implementation
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=initial_lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=weight_decay
+    )
 
 # Learning rate scheduler
 def get_lr(step):
@@ -636,171 +654,22 @@ class GroupedQueryAttention(nn.Module):
         self.v_proj = nn.Linear(config.n_embd, config.n_kv_heads * self.head_dim)
         self.o_proj = nn.Linear(config.n_embd, config.n_embd)
 
-def load_config(config_path='config.yaml'):
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+def validate_config(config):
+    required_keys = ['training', 'data', 'model', 'optimizer', 'logging', 'checkpointing']
+    for key in required_keys:
+        if key not in config:
+            raise ValueError(f"Missing required config section: {key}")
+    
+    if config['model']['model_config']['n_head'] % config['model']['model_config']['n_kv_heads'] != 0:
+        raise ValueError("n_head must be divisible by n_kv_heads")
 
-# Load configuration
-config = load_config()
+# Add after loading config:
+validate_config(config)
 
-# Update GPTConfig with values from YAML
-model_config = GPTConfig(
-    block_size=config['model']['model_config']['block_size'],
-    vocab_size=config['model']['model_config']['vocab_size'],
-    n_layer=config['model']['model_config']['n_layer'],
-    n_head=config['model']['model_config']['n_head'],
-    n_embd=config['model']['model_config']['n_embd'],
-    intermediate_size=config['model']['model_config']['intermediate_size'],
-    n_kv_heads=config['model']['model_config']['n_kv_heads'],
-    hidden_act=config['model']['model_config']['hidden_act'],
-    rms_norm_eps=config['model']['model_config']['rms_norm_eps'],
-    rope_theta=config['model']['model_config']['rope_theta']
-)
+def check_gpu_memory():
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory
+        if gpu_memory < 8 * 1024 * 1024 * 1024:  # 8GB
+            print("Warning: GPU has less than 8GB memory. You may encounter OOM errors.")
 
-class StreamingDataLoader:
-    def __init__(self, config):
-        self.batch_size = config['training']['batch_size']
-        self.sequence_length = config['training']['sequence_length']
-        self.tokenizer = tiktoken.get_encoding(config['data']['tokenizer'])
-        self.buffer_size = 100000  # Number of tokens to buffer
-        self.buffer = []
-        self.current_file = None
-        self.file_iterator = None
-        
-    def init_file_iterator(self, data_path):
-        """Initialize iterator over files in the dataset directory"""
-        if os.path.isdir(data_path):
-            self.files = [os.path.join(data_path, f) for f in os.listdir(data_path) 
-                         if f.endswith('.txt') or f.endswith('.json')]
-        else:
-            self.files = [data_path]
-        self.file_idx = 0
-        self.open_next_file()
-    
-    def open_next_file(self):
-        """Open next file in the dataset"""
-        if self.file_idx < len(self.files):
-            if self.current_file:
-                self.current_file.close()
-            self.current_file = open(self.files[self.file_idx], 'r')
-            self.file_iterator = iter(self.current_file)
-            self.file_idx += 1
-            return True
-        return False
-    
-    def fill_buffer(self):
-        """Fill the token buffer from current file"""
-        while len(self.buffer) < self.buffer_size:
-            try:
-                line = next(self.file_iterator)
-                tokens = self.tokenizer.encode(line)
-                self.buffer.extend(tokens)
-            except StopIteration:
-                if not self.open_next_file():
-                    break
-                continue
-            except Exception as e:
-                print(f"Error processing line: {e}")
-                continue
-    
-    def next_batch(self):
-        """Get next batch of tokens"""
-        # Fill buffer if needed
-        if len(self.buffer) < (self.batch_size * self.sequence_length + 1):
-            self.fill_buffer()
-            if len(self.buffer) < (self.batch_size * self.sequence_length + 1):
-                # Reset file iterator if we've reached the end
-                self.file_idx = 0
-                self.open_next_file()
-                self.fill_buffer()
-        
-        # Get batch from buffer
-        tokens = self.buffer[:(self.batch_size * self.sequence_length + 1)]
-        self.buffer = self.buffer[(self.batch_size * self.sequence_length):]
-        
-        # Reshape into batch
-        x = torch.tensor(tokens[:-1]).view(self.batch_size, self.sequence_length)
-        y = torch.tensor(tokens[1:]).view(self.batch_size, self.sequence_length)
-        
-        return x, y
-
-def run_performance_test(model, train_loader, device, use_flash=True):
-    print(f"\nRunning performance test {'with' if use_flash else 'without'} Flash Attention")
-    print("-" * 80)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    total_tokens = 0
-    total_time = 0
-    losses = []
-    
-    for i in range(50):
-        t0 = time.time()
-        
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        
-        optimizer.zero_grad()
-        logits, loss = model(x, y)
-        
-        loss.backward()
-        optimizer.step()
-        
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        
-        t1 = time.time()
-        dt = (t1 - t0) * 1000  # Convert to milliseconds
-        
-        # Calculate tokens per second
-        batch_tokens = x.numel()  # Number of tokens in this batch
-        tokens_per_sec = batch_tokens / (t1 - t0)
-        
-        total_tokens += batch_tokens
-        total_time += (t1 - t0)
-        losses.append(loss.item())
-        
-        print(f'step[{i:3d}] | loss: {loss.item():6.3f} | dt: {dt:7.2f}ms | tok/sec: {tokens_per_sec:10.2f}')
-    
-    # Print summary statistics
-    avg_tokens_per_sec = total_tokens / total_time
-    avg_loss = sum(losses) / len(losses)
-    print("\nPerformance Summary:")
-    print(f"Average tokens/sec: {avg_tokens_per_sec:,.2f}")
-    print(f"Average loss: {avg_loss:.4f}")
-    print(f"Total tokens processed: {total_tokens:,}")
-    print(f"Total time: {total_time:.2f} seconds")
-    print("-" * 80)
-    
-    return avg_tokens_per_sec, avg_loss
-
-# Run tests with both implementations
-if torch.cuda.is_available():
-    # Test with Flash Attention
-    model.to(device)
-    flash_tokens_per_sec, flash_loss = run_performance_test(model, train_loader, device, use_flash=True)
-    
-    # Test without Flash Attention (temporarily disable it)
-    def no_flash_attn(*args, **kwargs):
-        q, k, v = args
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
-        scores = F.softmax(scores, dim=-1)
-        return torch.matmul(scores, v)
-    
-    # Temporarily replace flash_attn_func
-    original_flash_attn = flash_attn_func
-    flash_attn_func = no_flash_attn
-    
-    regular_tokens_per_sec, regular_loss = run_performance_test(model, train_loader, device, use_flash=False)
-    
-    # Restore original flash_attn_func
-    flash_attn_func = original_flash_attn
-    
-    # Print comparison
-    print("\nPerformance Comparison:")
-    print(f"Flash Attention: {flash_tokens_per_sec:,.2f} tokens/sec")
-    print(f"Regular Attention: {regular_tokens_per_sec:,.2f} tokens/sec")
-    print(f"Speedup: {flash_tokens_per_sec/regular_tokens_per_sec:.2f}x")
-else:
-    print("\nCUDA not available. Flash Attention requires a GPU.")
-    regular_tokens_per_sec, regular_loss = run_performance_test(model, train_loader, device, use_flash=False)
+check_gpu_memory()
