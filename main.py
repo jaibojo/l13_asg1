@@ -359,6 +359,10 @@ class StreamingDataLoader:
         tokens = self.buffer[:(self.batch_size * self.sequence_length + 1)]
         self.buffer = self.buffer[(self.batch_size * self.sequence_length):]
         
+        # Ensure tokens are within vocabulary range
+        vocab_size = config['model']['model_config']['vocab_size']
+        tokens = [min(t, vocab_size-1) for t in tokens]  # Clip tokens to vocab size
+        
         # Reshape into batch
         x = torch.tensor(tokens[:-1]).view(self.batch_size, self.sequence_length)
         y = torch.tensor(tokens[1:]).view(self.batch_size, self.sequence_length)
@@ -561,60 +565,70 @@ best_loss = float('inf')
 total_steps = config['training']['num_training_steps']
 
 try:
-    while global_step < total_steps:
-        model.train()
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        
-        optimizer.zero_grad()
-        logits, loss = model(x, y)
-        loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(), 
-            config['optimizer']['gradient_clip']
-        )
-        
-        optimizer.step()
-        
-        # Update learning rate
-        lr = get_lr(global_step)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        
-        global_step += 1
-        
-        # Logging
-        if global_step % config['logging']['log_interval'] == 0:
-            print(f'step {global_step}/{total_steps}, '
-                  f'loss: {loss.item():.4f}, lr: {lr:.2e}')
-        
-        # Checkpointing
-        if global_step % config['checkpointing']['save_interval'] == 0:
-            save_checkpoint(
-                model,
-                optimizer,
-                global_step,
-                loss.item(),
-                is_best=(loss.item() < best_loss)
-            )
-            if loss.item() < best_loss:
-                best_loss = loss.item()
-                print(f"New best loss: {best_loss:.4f}")
+    total_tokens = 0
+    total_time = 0
+    losses = []
+    
+    for i in range(50):  # Using 50 iterations as in your original code
+        try:
+            t0 = time.time()
+            
+            x, y = train_loader.next_batch()
+            
+            # Validate input tokens are within vocabulary range
+            if x.max() >= config['model']['model_config']['vocab_size']:
+                print(f"Warning: Input contains token {x.max()} which is >= vocab_size {config['model']['model_config']['vocab_size']}")
+                continue
+                
+            x, y = x.to(device), y.to(device)
+            
+            optimizer.zero_grad()
+            logits, loss = model(x, y)
+            
+            loss.backward()
+            optimizer.step()
+            
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            t1 = time.time()
+            dt = (t1 - t0) * 1000  # Convert to milliseconds
+            
+            # Calculate tokens per second
+            batch_tokens = x.numel()  # Number of tokens in this batch
+            tokens_per_sec = batch_tokens / (t1 - t0)
+            
+            total_tokens += batch_tokens
+            total_time += (t1 - t0)
+            losses.append(loss.item())
+            
+            print(f'step[{i:3d}] | loss: {loss.item():6.3f} | dt: {dt:7.2f}ms | tok/sec: {tokens_per_sec:10.2f}')
+            
+        except Exception as e:
+            print(f"Error in training step: {e}")
+            continue
+    
+    # Print summary only if we have losses
+    if losses:
+        avg_loss = sum(losses) / len(losses)
+        print(f"\nTraining Summary:")
+        print(f"Average loss: {avg_loss:.4f}")
+        print(f"Total tokens processed: {total_tokens:,}")
+        print(f"Total time: {total_time:.2f} seconds")
+        if total_time > 0:
+            print(f"Average tokens/sec: {total_tokens/total_time:,.2f}")
+    else:
+        print("No successful training steps completed")
 
 except KeyboardInterrupt:
-    print("Training interrupted by user")
+    print("\nTraining interrupted by user")
+except Exception as e:
+    print(f"\nTraining failed with error: {e}")
 finally:
-    print(f'Training completed/interrupted. Best loss: {best_loss:.4f}')
-    # Save final checkpoint
-    save_checkpoint(
-        model,
-        optimizer,
-        global_step,
-        loss.item(),
-        is_best=False
-    )
+    if 'loss' in locals() and losses:
+        print(f'Final loss: {loss.item():.4f}')
+    else:
+        print("No loss value available")
 
 
 print(loss)
