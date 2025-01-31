@@ -1,6 +1,7 @@
 # Required packages for GPT implementation
 torch>=2.0.0
-transformers>=4.30.0
-tiktoken>=0.5.0
-pyyaml>=6.0.1
-datasets>=2.15.0  # For loading HuggingFace datasets 
+transformers>=4.36.0  # For GPT2LMHeadModel
+datasets>=2.15.0      # For load_dataset
+tiktoken>=0.5.0       # For tokenization
+PyYAML>=6.0.1        # For config file handling
+flash-attn>=2.3.3    # For Flash Attention 

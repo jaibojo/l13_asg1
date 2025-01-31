@@ -10,6 +10,7 @@ from torch.nn import functional as F
 import yaml
 import tiktoken
 from datasets import load_dataset
+from flash_attn import flash_attn_func  # Add this import at the top
 
 
 class CausalSelfAttention(nn.Module):
@@ -158,17 +159,15 @@ class LlamaSdpaAttention(nn.Module):
         k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
         v = v.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
         
-        # Scaled dot product attention
+        # Reshape for Flash Attention
         q = q.transpose(1, 2)  # (B, nh, T, hs)
         k = k.transpose(1, 2)  # (B, nh, T, hs)
         v = v.transpose(1, 2)  # (B, nh, T, hs)
         
-        # Compute attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        scores = F.softmax(scores.float(), dim=-1).type_as(q)
+        # Use Flash Attention
+        output = flash_attn_func(q, k, v, causal=True)  # Flash attention with causal mask
         
-        # Apply attention to values
-        output = torch.matmul(scores, v)  # (B, nh, T, hs)
+        # Reshape output
         output = output.transpose(1, 2).contiguous().view(B, T, -1)
         
         return self.o_proj(output)
@@ -359,7 +358,58 @@ class StreamingDataLoader:
         return x, y
 
 
-model = GPT(GPTConfig())
+def load_config(config_path='config.yaml'):
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
+
+# Load configuration
+try:
+    config = load_config()
+except FileNotFoundError:
+    # Provide default configuration if file doesn't exist
+    config = {
+        'training': {
+            'batch_size': 8,
+            'sequence_length': 2048,
+        },
+        'data': {
+            'tokenizer': 'gpt2',
+            'buffer_size': 100000,
+        },
+        'model': {
+            'model_config': {
+                'block_size': 2048,
+                'vocab_size': 49152,
+                'n_layer': 30,
+                'n_head': 9,
+                'n_embd': 576,
+                'intermediate_size': 1536,
+                'n_kv_heads': 3,
+                'hidden_act': 'silu',
+                'rms_norm_eps': 1e-5,
+                'rope_theta': 10000.0
+            }
+        },
+        'optimizer': {
+            'gradient_clip': 1.0
+        },
+        'logging': {
+            'log_interval': 100
+        },
+        'checkpointing': {
+            'checkpoint_dir': 'checkpoints',
+            'save_interval': 1000
+        }
+    }
+    # Save default config
+    os.makedirs('checkpoints', exist_ok=True)
+    with open('config.yaml', 'w') as f:
+        yaml.dump(config, f)
+    print("Created default config.yaml")
+
+# Then create the model and train_loader
+model = GPT(GPTConfig(**config['model']['model_config']))
 model.to(device)
 
 train_loader = StreamingDataLoader(config)
@@ -674,3 +724,83 @@ class StreamingDataLoader:
         y = torch.tensor(tokens[1:]).view(self.batch_size, self.sequence_length)
         
         return x, y
+
+def run_performance_test(model, train_loader, device, use_flash=True):
+    print(f"\nRunning performance test {'with' if use_flash else 'without'} Flash Attention")
+    print("-" * 80)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    total_tokens = 0
+    total_time = 0
+    losses = []
+    
+    for i in range(50):
+        t0 = time.time()
+        
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        
+        loss.backward()
+        optimizer.step()
+        
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
+        t1 = time.time()
+        dt = (t1 - t0) * 1000  # Convert to milliseconds
+        
+        # Calculate tokens per second
+        batch_tokens = x.numel()  # Number of tokens in this batch
+        tokens_per_sec = batch_tokens / (t1 - t0)
+        
+        total_tokens += batch_tokens
+        total_time += (t1 - t0)
+        losses.append(loss.item())
+        
+        print(f'step[{i:3d}] | loss: {loss.item():6.3f} | dt: {dt:7.2f}ms | tok/sec: {tokens_per_sec:10.2f}')
+    
+    # Print summary statistics
+    avg_tokens_per_sec = total_tokens / total_time
+    avg_loss = sum(losses) / len(losses)
+    print("\nPerformance Summary:")
+    print(f"Average tokens/sec: {avg_tokens_per_sec:,.2f}")
+    print(f"Average loss: {avg_loss:.4f}")
+    print(f"Total tokens processed: {total_tokens:,}")
+    print(f"Total time: {total_time:.2f} seconds")
+    print("-" * 80)
+    
+    return avg_tokens_per_sec, avg_loss
+
+# Run tests with both implementations
+if torch.cuda.is_available():
+    # Test with Flash Attention
+    model.to(device)
+    flash_tokens_per_sec, flash_loss = run_performance_test(model, train_loader, device, use_flash=True)
+    
+    # Test without Flash Attention (temporarily disable it)
+    def no_flash_attn(*args, **kwargs):
+        q, k, v = args
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+        scores = F.softmax(scores, dim=-1)
+        return torch.matmul(scores, v)
+    
+    # Temporarily replace flash_attn_func
+    original_flash_attn = flash_attn_func
+    flash_attn_func = no_flash_attn
+    
+    regular_tokens_per_sec, regular_loss = run_performance_test(model, train_loader, device, use_flash=False)
+    
+    # Restore original flash_attn_func
+    flash_attn_func = original_flash_attn
+    
+    # Print comparison
+    print("\nPerformance Comparison:")
+    print(f"Flash Attention: {flash_tokens_per_sec:,.2f} tokens/sec")
+    print(f"Regular Attention: {regular_tokens_per_sec:,.2f} tokens/sec")
+    print(f"Speedup: {flash_tokens_per_sec/regular_tokens_per_sec:.2f}x")
+else:
+    print("\nCUDA not available. Flash Attention requires a GPU.")
+    regular_tokens_per_sec, regular_loss = run_performance_test(model, train_loader, device, use_flash=False)
