@@ -4,4 +4,6 @@ transformers>=4.36.0  # For GPT2LMHeadModel
 datasets>=2.15.0      # For load_dataset
 tiktoken>=0.5.0       # For tokenization
 PyYAML>=6.0.1        # For config file handling
-flash-attn>=2.3.3    # For Flash Attention 
+flash-attn>=2.3.3    # Optional: For Flash Attention (CUDA only)
+numpy>=1.24.0        # Add this for numerical operations
+tqdm>=4.65.0         # Add this for progress bars
