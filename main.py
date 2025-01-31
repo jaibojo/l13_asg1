@@ -13,7 +13,9 @@ from datasets import load_dataset
 
 try:
     from flash_attn import flash_attn_func
-    FLASH_ATTENTION_AVAILABLE = True
+    FLASH_ATTENTION_AVAILABLE = torch.cuda.is_available()  # Only True if we have both the package and CUDA
+    if not FLASH_ATTENTION_AVAILABLE:
+        print("Flash Attention requires CUDA. Using regular attention.")
 except ImportError:
     print("Flash Attention not available. Using regular attention.")
     FLASH_ATTENTION_AVAILABLE = False
@@ -161,10 +163,10 @@ class LlamaSdpaAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim)
         
-        # Get rotary embeddings with correct shape
-        rot_emb = self.rotary_emb(x, T)  # [1, T, 1, d]
+        # Get rotary embeddings
+        rot_emb = self.rotary_emb(x, T)
         
-        # Apply rotary embeddings - broadcasting will handle batch and head dimensions
+        # Apply rotary embeddings
         q = (q * torch.cos(rot_emb)) + (self.rotate_half(q) * torch.sin(rot_emb))
         k = (k * torch.cos(rot_emb)) + (self.rotate_half(k) * torch.sin(rot_emb))
         
@@ -177,22 +179,31 @@ class LlamaSdpaAttention(nn.Module):
         k = k.transpose(1, 2)  # (B, nh, T, hs)
         v = v.transpose(1, 2)  # (B, nh, T, hs)
         
-        # Use Flash Attention if available, otherwise use regular attention
-        if FLASH_ATTENTION_AVAILABLE:
+        # Regular attention for CPU, Flash Attention for CUDA
+        if FLASH_ATTENTION_AVAILABLE and x.is_cuda:
             output = flash_attn_func(q, k, v, causal=True)
         else:
-            # Regular attention
-            scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores = scores.masked_fill(
-                torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool(),
-                float('-inf')
+            # Regular attention with memory efficient implementation
+            scale = 1.0 / math.sqrt(self.head_dim)
+            
+            # Compute attention scores
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            
+            # Apply causal mask
+            causal_mask = torch.triu(
+                torch.ones(T, T, dtype=torch.bool, device=x.device), 
+                diagonal=1
             )
-            scores = F.softmax(scores, dim=-1)
-            output = scores @ v
+            scores.masked_fill_(causal_mask, float('-inf'))
+            
+            # Compute attention probabilities
+            attn_probs = F.softmax(scores, dim=-1)
+            
+            # Apply attention to values
+            output = torch.matmul(attn_probs, v)
         
-        # Reshape output
+        # Reshape output and project
         output = output.transpose(1, 2).contiguous().view(B, T, -1)
-        
         return self.o_proj(output)
     
     @staticmethod
