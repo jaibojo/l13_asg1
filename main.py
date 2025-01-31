@@ -110,7 +110,8 @@ class LlamaRotaryEmbedding(nn.Module):
         t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        return emb[None, :, :]
+        # Reshape to match input dimensions
+        return emb[None, None, :, :]  # Add batch and head dimensions
 
 class LlamaRMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
@@ -149,12 +150,15 @@ class LlamaSdpaAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size()
         
+        # Project q, k, v
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim)
         k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim)
         
-        # Apply rotary embeddings
-        rot_emb = self.rotary_emb(x, T)
+        # Get rotary embeddings
+        rot_emb = self.rotary_emb(x, T)  # Now shape [1, 1, T, d]
+        
+        # Apply rotary embeddings - broadcasting will handle the batch and head dimensions
         q = q * torch.cos(rot_emb) + self.rotate_half(q) * torch.sin(rot_emb)
         k = k * torch.cos(rot_emb) + self.rotate_half(k) * torch.sin(rot_emb)
         
@@ -162,13 +166,23 @@ class LlamaSdpaAttention(nn.Module):
         k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
         v = v.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
         
-        # Reshape for Flash Attention
+        # Reshape for attention
         q = q.transpose(1, 2)  # (B, nh, T, hs)
         k = k.transpose(1, 2)  # (B, nh, T, hs)
         v = v.transpose(1, 2)  # (B, nh, T, hs)
         
-        # Use Flash Attention
-        output = flash_attn_func(q, k, v, causal=True)  # Flash attention with causal mask
+        # Use Flash Attention if available, otherwise use regular attention
+        if FLASH_ATTENTION_AVAILABLE:
+            output = flash_attn_func(q, k, v, causal=True)
+        else:
+            # Regular attention
+            scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = scores.masked_fill(
+                torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool(),
+                float('-inf')
+            )
+            scores = F.softmax(scores, dim=-1)
+            output = scores @ v
         
         # Reshape output
         output = output.transpose(1, 2).contiguous().view(B, T, -1)
@@ -626,13 +640,12 @@ except Exception as e:
     print(f"\nTraining failed with error: {e}")
 finally:
     if 'loss' in locals() and losses:
-        print(f'Final loss: {loss.item():.4f}')
+        print(f'Final loss: {losses[-1]:.4f}')  # Use the last loss from losses list
     else:
         print("No loss value available")
 
-
-print(loss)
-import sys; sys.exit(0)
+# Remove the print(loss) statement after the training loop
+# import sys; sys.exit(0)  # Keep this if you want to exit
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
