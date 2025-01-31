@@ -87,16 +87,16 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 2048          # Increased from 1024 to 2048 to match max_position_embeddings
-    vocab_size: int = 49152         # Changed from 50257 to 49152
-    n_layer: int = 30               # Increased from 12 to 30
-    n_head: int = 9                 # Changed from 12 to 9
-    n_embd: int = 576              # Changed from 768 to 576
-    intermediate_size: int = 1536   # New parameter for MLP
-    n_kv_heads: int = 3            # New parameter for grouped-query attention
-    hidden_act: str = 'silu'       # Changed from GELU to SiLU
-    rms_norm_eps: float = 1e-5     # For RMSNorm
-    rope_theta: float = 10000.0    # RoPE parameter
+    block_size: int = 2048          
+    vocab_size: int = 49152         
+    n_layer: int = 30               
+    n_head: int = 9                 
+    n_embd: int = 576              
+    intermediate_size: int = 1536   
+    n_kv_heads: int = 3            
+    hidden_act: str = 'silu'       
+    rms_norm_eps: float = 1e-5     
+    rope_theta: float = 10000.0    
 
 
 class LlamaRotaryEmbedding(nn.Module):
@@ -416,7 +416,30 @@ except FileNotFoundError:
         yaml.dump(config, f)
     print("Created default config.yaml")
 
-# Then create the model and train_loader
+def validate_model_config(config_dict):
+    """Validate that all required model config parameters are present"""
+    required_params = {
+        'block_size', 'vocab_size', 'n_layer', 'n_head', 'n_embd',
+        'intermediate_size', 'n_kv_heads', 'hidden_act', 'rms_norm_eps',
+        'rope_theta'
+    }
+    
+    model_config = config_dict['model']['model_config']
+    missing_params = required_params - set(model_config.keys())
+    extra_params = set(model_config.keys()) - required_params
+    
+    if missing_params:
+        raise ValueError(f"Missing required parameters in model config: {missing_params}")
+    if extra_params:
+        print(f"Warning: Extra parameters in model config will be ignored: {extra_params}")
+        # Remove extra parameters
+        for param in extra_params:
+            del model_config[param]
+    
+    return config_dict
+
+# Add before creating the model:
+config = validate_model_config(config)
 model = GPT(GPTConfig(**config['model']['model_config']))
 model.to(device)
 
