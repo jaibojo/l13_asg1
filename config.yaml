@@ -1,0 +1,65 @@
+# Model configuration for GPT Implementation
+model:
+  model_config:
+    block_size: 2048
+    vocab_size: 49152
+    n_layer: 30
+    n_head: 9
+    n_embd: 576
+    intermediate_size: 1536
+    n_kv_heads: 3
+    hidden_act: silu
+    rms_norm_eps: 1.0e-5
+    rope_theta: 10000.0
+    init_method:
+      std: 0.02
+
+training:
+  batch_size: 8
+  sequence_length: 2048
+  accumulation_steps: 2
+  num_epochs: 25
+  num_training_steps: 600000
+  seed: 1337
+
+optimizer:
+  name: adamW
+  learning_rate: 3.0e-3
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  fused: true
+  gradient_clip: 1.0
+
+lr_scheduler:
+  warmup_steps: 5000
+  decay_start: 500000
+  decay_steps: 100000
+  min_lr: 0.0
+  decay_style: sqrt
+
+data:
+  tokenizer: gpt2
+  dataset_name: "HuggingFaceTB/smollm-corpus"
+  dataset_config: "cosmopedia-v2"
+  buffer_size: 100000
+  streaming: true
+  num_workers: 1
+
+checkpointing:
+  save_best: true
+  checkpoint_dir: checkpoints
+  checkpoint_name: best_model.pt
+  save_interval: 500  # Save checkpoint every 500 steps
+  keep_last_checkpoints: 3  # Number of recent checkpoints to keep
+  save_optimizer: true
+
+device:
+  type: auto  # Will automatically select cuda if available, else cpu
+  seed: 1337
+
+logging:
+  log_interval: 100
+  save_interval: 2000
+  tensorboard: false  # Set to true when tensorboard logging is implemented 
