@@ -10,6 +10,8 @@ from torch.nn import functional as F
 import yaml
 import tiktoken
 from datasets import load_dataset
+from requests.exceptions import ReadTimeout, ConnectionError
+from time import sleep
 
 try:
     from flash_attn import flash_attn_func
@@ -349,36 +351,65 @@ class StreamingDataLoader:
     def __init__(self, config):
         self.batch_size = config['training']['batch_size']
         self.sequence_length = config['training']['sequence_length']
-        self.tokenizer = tiktoken.get_encoding(config['data']['tokenizer'])
-        self.buffer_size = config['data']['buffer_size']
         self.buffer = []
         
-        # Load dataset from HuggingFace
-        self.dataset = load_dataset(
-            "HuggingFaceTB/smollm-corpus",
-            "cosmopedia-v2",
-            split="train",
-            streaming=True
-        )
-        self.data_iterator = iter(self.dataset)
+        # Initialize tokenizer
+        self.tokenizer = tiktoken.get_encoding(config['data'].get('tokenizer', 'gpt2'))
         
-    def fill_buffer(self):
-        """Fill the token buffer from dataset"""
-        while len(self.buffer) < self.buffer_size:
+        # Load dataset with retry logic
+        max_retries = 3
+        retry_delay = 5  # seconds
+        
+        for attempt in range(max_retries):
             try:
-                # Get next example from dataset
-                example = next(self.data_iterator)
-                # Get text from example
-                text = example['text']
-                # Tokenize text
-                tokens = self.tokenizer.encode(text)
+                print(f"Attempting to load dataset (attempt {attempt + 1}/{max_retries})")
+                self.dataset = load_dataset(
+                    "togethercomputer/RedPajama-Data-1T-Sample",
+                    split="train",
+                    streaming=True
+                )
+                print("Dataset loaded successfully")
+                break
+            except (ReadTimeout, ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    print(f"Attempt {attempt + 1} failed: {str(e)}")
+                    print(f"Retrying in {retry_delay} seconds...")
+                    sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    print("Failed to load dataset after all retries. Using fallback data.")
+                    # Use a small local dataset as fallback
+                    self.dataset = self._create_fallback_dataset()
+    
+    def _create_fallback_dataset(self):
+        """Create a small local dataset for testing when HF dataset is unavailable"""
+        sample_texts = [
+            "This is a sample text for training when the main dataset is unavailable.",
+            "The quick brown fox jumps over the lazy dog.",
+            "In machine learning, we train models on data to make predictions.",
+            # Add more sample texts as needed
+        ]
+        
+        def text_generator():
+            while True:
+                for text in sample_texts:
+                    yield {"text": text}
+        
+        return text_generator()
+    
+    def fill_buffer(self, min_size=100000):
+        """Fill the buffer with tokens"""
+        while len(self.buffer) < min_size:
+            try:
+                batch = next(iter(self.dataset))
+                tokens = self.tokenizer.encode(batch['text'])
                 self.buffer.extend(tokens)
-            except StopIteration:
-                # Reset iterator when we reach the end
-                self.data_iterator = iter(self.dataset)
-            except Exception as e:
-                print(f"Error processing example: {e}")
-                continue
+            except (StopIteration, Exception) as e:
+                print(f"Warning: Error filling buffer: {str(e)}")
+                if len(self.buffer) == 0:
+                    # If buffer is empty, add some fallback data
+                    self.buffer.extend(self.tokenizer.encode("Error loading data. This is fallback text."))
+                break
     
     def next_batch(self):
         """Get next batch of tokens"""
